@@ -95,7 +95,8 @@ You have these actions. Each turn, reply with ONE JSON object and nothing else.
     Replace whole rows at once. Each row must be exactly ${SIZE} letters.
 
 {"action": "clear"}
-    Wipe the canvas.
+    Wipe the canvas you are currently working on. This does NOT delete anything already saved
+    in your gallery. You cannot delete saved drawings, and saving an identical drawing twice is refused.
 
 {"action": "save", "title": "..."}
     Save the current canvas to your gallery with a title. Do this when you finish a piece.
@@ -126,7 +127,9 @@ You have these actions. Each turn, reply with ONE JSON object and nothing else.
     Move your draft into your song collection as a finished song. The title is optional.
 
 {"action": "clear_draft"}
-    Throw away your song in progress.
+    Throw away the song you are currently working on. This does NOT delete finished songs in your
+    collection. You cannot delete finished songs, and saving an identical song twice is refused.
+    The same goes for journal entries: you cannot delete them, and identical ones are refused.
 
 {"action": "search", "query": "..."}
     Search the web with Google. You'll see a short summary of what it found next turn. Then you can write about it.
