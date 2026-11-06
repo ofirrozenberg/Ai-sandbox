@@ -296,23 +296,44 @@ function sleepUnlessStopped(ms) {
     tick();
   });
 }
-async function callGemini(body) {
+const NET = { timeout: 60000, busyWait: 10000, rateWait: 20000 };   // how long to wait on Google (milliseconds)
+async function callGemini(body, attempts = 5) {
   const c = getConfig();
   const url = API + "models/" + encodeURIComponent(c.model) + ":generateContent?key=" + encodeURIComponent(c.api_key);
-  for (let attempt = 0; attempt < 3; attempt++) {
+  let problem = "Google didn't answer.";
+  for (let attempt = 1; attempt <= attempts; attempt++) {
     abortCtl = new AbortController();
-    let res;
+    let timedOut = false, status = 0;
+    const timer = setTimeout(() => { timedOut = true; abortCtl.abort(); }, NET.timeout);
     try {
-      res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: abortCtl.signal });
+      const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: abortCtl.signal });
+      status = res.status;
+      if (res.ok) return await res.json();
+      if (![429, 500, 502, 503, 504].includes(status)) {
+        throw new Error("Google API error " + status + ": " + (await res.text()).slice(0, 300));
+      }
+      problem = status === 429 ? "You hit Google's free limit." : "Google is busy right now (error " + status + ").";
     } catch (e) {
-      if (e.name === "AbortError") return null;
-      throw new Error("Couldn't reach Google. Check your internet connection.");
+      if (stopRequested) return null;
+      if (e.name === "AbortError") {
+        if (!timedOut) return null;
+        problem = "Google took too long to answer.";
+      } else if (e.message && e.message.startsWith("Google API error")) {
+        throw e;
+      } else {
+        if (navigator.onLine === false) throw new Error("Your phone looks offline. Check your internet connection.");
+        // Google often drops the connection when it is overloaded, so this is worth another try
+        problem = "Couldn't get an answer from Google (usually a temporary overload, not your internet).";
+      }
+    } finally { clearTimeout(timer); }
+    if (attempt < attempts) {   // wait, then try again by itself
+      STATUS.last = problem + " Trying again (" + attempt + " of " + attempts + ")...";
+      refresh();
+      await sleepUnlessStopped(status === 429 ? NET.rateWait : NET.busyWait);
+      if (stopRequested) return null;
     }
-    if (res.status === 429) { await sleepUnlessStopped(20000); if (stopRequested) return null; continue; }  // rate limited, wait and retry
-    if (!res.ok) throw new Error("Google API error " + res.status + ": " + (await res.text()).slice(0, 300));
-    return await res.json();
   }
-  throw new Error("Rate limited too many times. Try again in a few minutes.");
+  throw new Error(problem + (attempts > 1 ? " I gave up after " + attempts + " tries." : "") + " Try again in a few minutes, or pick a different model in Settings.");
 }
 function replyText(payload) {
   const cands = (payload && payload.candidates) || [];
@@ -534,6 +555,7 @@ async function sessionLoop() {
   let c = getConfig(), state = getState(), budget = c.daily_minutes * 60, lastResult = "";
   while (!stopRequested && state.seconds_used < budget && state.turns < c.max_turns) {
     const t0 = Date.now();
+    STATUS.last = "thinking..."; refresh();
     const reply = await askAI(buildPrompt(lastResult, (budget - state.seconds_used) / 60, c.max_turns - state.turns));
     if (stopRequested) break;
 
@@ -743,7 +765,7 @@ const renderers = {
       const ch = {}; if (key) ch.api_key = key; if (model) ch.model = model; updateConfig(ch); fields.api_key.value = "";
       out.className = "dim"; out.textContent = "Testing...";
       try {
-        const p = await callGemini({ contents: [{ role: "user", parts: [{ text: "Reply with the single word: ok" }] }] });
+        const p = await callGemini({ contents: [{ role: "user", parts: [{ text: "Reply with the single word: ok" }] }] }, 1);
         out.className = "ok"; out.textContent = "It works! The AI replied: " + replyText(p).trim().slice(0, 40);
       } catch (e) { out.className = "err"; out.textContent = e.message; }
     };
