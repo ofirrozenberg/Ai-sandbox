@@ -25,6 +25,8 @@ button{font-family:inherit}
 .go{background:#2563eb;color:#fff;border:0;border-radius:12px;padding:14px;font-size:17px;width:100%;margin-top:10px}
 .go.grey{background:#374151}
 .btn{background:#222;color:#eee;border:1px solid #555;border-radius:10px;padding:10px 14px;font-size:15px;margin:8px 8px 0 0}
+.btn.del{color:#ff7b72;border-color:#7a2e2a}
+.bubble .del{margin:6px 0 0;padding:4px 10px;font-size:12px}
 .entry{border-left:3px solid #666;padding:4px 10px;margin:12px 0;white-space:pre-wrap;overflow-wrap:anywhere}
 .time{color:#888;font-size:12px}
 .g{display:inline-block;margin:6px;text-align:center;font-size:13px}
@@ -367,10 +369,19 @@ async function webSearch(query) {
 }
 
 // ================================================================ THE AI'S ACTIONS
+// Duplicate detection: the AI can never save the same journal text, drawing or song twice.
+const normText = t => String(t).toLowerCase().replace(/\s+/g, " ").trim();
+function songSignature(tempo, tracks) {
+  return JSON.stringify([cleanTempo(tempo), tracks.map(t => [t.wave, t.volume, t.notes.map(n => [String(n[0]).trim().toLowerCase(), Number(n[1])])])]);
+}
 function publishSong(title, tempo, tracks) {
   let seconds;
   try { seconds = renderSong(tempo, tracks).seconds; }
   catch (e) { return { ok: false, message: "Could not render the song: " + e.message }; }
+  const sig = songSignature(tempo, tracks);
+  if (W.songs.some(s => songSignature(s.tempo, s.tracks) === sig)) {
+    return { ok: false, message: "That song is identical to one already in your collection, so it was NOT saved. Write something new and different." };
+  }
   W.songs.push({ time: nowStr(), title, tempo, seconds: Math.round(seconds * 10) / 10, tracks });
   saveWorld();
   return { ok: true, message: "Finished '" + title + "' (" + Math.round(seconds) + " seconds). It's saved in your music collection." };
@@ -390,6 +401,7 @@ async function doAction(reply) {
   if (action === "journal") {
     const text = String(reply.text || "").trim();
     if (!text) return "Journal entry was empty.";
+    if (W.journal.some(e => normText(e.text) === normText(text))) return "That journal entry is identical to an earlier one, so it was NOT saved. Write something new.";
     W.journal.push({ time: nowStr(), text }); saveWorld();
     return "Journal entry saved.";
   }
@@ -417,6 +429,7 @@ async function doAction(reply) {
   if (action === "clear") { W.canvas = blankCanvas(); saveWorld(); return "Canvas cleared."; }
   if (action === "save") {
     const title = String(reply.title || "Untitled");
+    if (W.gallery.some(g => g.rows.join("") === W.canvas.join(""))) return "This exact drawing is already in your gallery, so it was NOT saved again. Change the canvas first.";
     W.gallery.push({ time: nowStr(), title, rows: W.canvas.slice() }); saveWorld();
     return "Saved '" + title + "' to your gallery.";
   }
@@ -593,6 +606,16 @@ function draw(cv, rows, scale) {
 function empty(v, msg) { v.appendChild(el("p", "dim", msg)); }
 function go(name) { location.hash = name; }
 
+// Delete buttons: these exist only in the screens, for the human. The AI has no action that can delete anything.
+function delBtn(what, doDelete) {
+  const b = el("button", "btn del", "🗑 Delete");
+  b.onclick = () => {
+    if (!confirm("Delete this " + what + "? This can't be undone.")) return;
+    doDelete(); saveWorld(); lastSig = ""; refresh(); toast("Deleted.");
+  };
+  return b;
+}
+
 function playerFor(card, tempo, tracks) {   // renders the song only when you tap play
   const b = el("button", "btn", "▶ Play");
   b.onclick = () => {
@@ -656,10 +679,11 @@ const renderers = {
       ? "The AI is awake and will see your message on its next turn."
       : "The AI is asleep. It will read your messages when it wakes up."));
     if (!W.messages.length) empty(v, "No messages yet. Say hi!");
-    W.messages.forEach(m => {
+    W.messages.forEach((m, i) => {
       const row = el("div", "row " + (m.from === "you" ? "you" : "ai"));
       const b = el("div", "bubble"); b.appendChild(document.createTextNode(m.text));
       b.appendChild(el("div", "time", (m.from === "you" ? "You" : "AI") + " · " + m.time));
+      b.appendChild(delBtn("message", () => W.messages.splice(i, 1)));
       row.appendChild(b); v.appendChild(row);
     });
     const bar = el("div", "composer");
@@ -676,25 +700,30 @@ const renderers = {
   canvas(v) {
     v.appendChild(el("h2", null, "Canvas right now"));
     const c = el("canvas"); draw(c, W.canvas, 14); v.appendChild(c);
+    v.appendChild(el("br"));
+    const clr = delBtn("canvas drawing (clears the canvas, saved drawings stay)", () => { W.canvas = blankCanvas(); });
+    clr.textContent = "🗑 Clear canvas"; v.appendChild(clr);
   },
   gallery(v) {
     v.appendChild(el("h2", null, "Saved drawings"));
     if (!W.gallery.length) return empty(v, "Nothing saved yet.");
-    [...W.gallery].reverse().forEach(p => {
+    W.gallery.map((p, i) => [p, i]).reverse().forEach(([p, i]) => {
       const d = el("div", "g"); const c = el("canvas"); draw(c, p.rows, 8);
       d.appendChild(c); d.appendChild(el("div", null, p.title)); d.appendChild(el("div", "time", p.time));
+      d.appendChild(el("div")).appendChild(delBtn("drawing", () => W.gallery.splice(i, 1)));
       v.appendChild(d);
     });
   },
   music(v) {
     v.appendChild(el("h2", null, "Songs"));
     if (!W.songs.length) return empty(v, "No songs yet.");
-    [...W.songs].reverse().forEach(s => {
+    W.songs.map((s, i) => [s, i]).reverse().forEach(([s, i]) => {
       const d = el("div", "card");
       d.appendChild(el("b", null, s.title));
       d.appendChild(el("div", "time", s.time + " · " + s.seconds + "s · " + s.tempo + " bpm · " + s.tracks.length + " tracks"));
       playerFor(d, s.tempo, s.tracks);
       const dl = el("button", "btn", "⬇ Save .wav"); dl.onclick = () => downloadSong(s); d.appendChild(dl);
+      d.appendChild(delBtn("song", () => W.songs.splice(i, 1)));
       v.appendChild(d);
     });
   },
@@ -706,6 +735,7 @@ const renderers = {
     card.appendChild(el("b", null, d.title));
     card.appendChild(el("div", "time", "updated " + d.updated + " · " + d.seconds + "s · " + d.tempo + " bpm · " + d.tracks.length + " tracks"));
     if (d.seconds > 0) playerFor(card, d.tempo, d.tracks); else card.appendChild(el("div", "dim", "Not playable yet."));
+    card.appendChild(delBtn("song in progress", () => { W.draft = null; }));
     v.appendChild(card);
     d.tracks.forEach((t, i) => {
       const c = el("div", "card");
@@ -717,19 +747,22 @@ const renderers = {
   searches(v) {
     v.appendChild(el("h2", null, "Web searches"));
     if (!W.searches.length) return empty(v, "No searches yet.");
-    [...W.searches].reverse().forEach(s => {
+    W.searches.map((s, i) => [s, i]).reverse().forEach(([s, i]) => {
       const d = el("div", "card");
       d.appendChild(el("b", null, s.query)); d.appendChild(el("div", "time", s.time));
       d.appendChild(el("div", null, s.results)).style.whiteSpace = "pre-wrap";
+      d.appendChild(delBtn("search", () => W.searches.splice(i, 1)));
       v.appendChild(d);
     });
   },
   journal(v) {
     v.appendChild(el("h2", null, "Journal"));
     if (!W.journal.length) return empty(v, "No entries yet.");
-    [...W.journal].reverse().forEach(e => {
+    W.journal.map((e, i) => [e, i]).reverse().forEach(([e, i]) => {
       const d = el("div", "entry"); d.appendChild(el("div", "time", e.time));
-      d.appendChild(document.createTextNode(e.text)); v.appendChild(d);
+      d.appendChild(document.createTextNode(e.text));
+      d.appendChild(el("div")).appendChild(delBtn("journal entry", () => W.journal.splice(i, 1)));
+      v.appendChild(d);
     });
   },
   settings(v) {
