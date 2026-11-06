@@ -52,6 +52,7 @@ input[type=text],input[type=password],input[type=number]{width:100%;background:#
 "use strict";
 
 // ================================================================ CONSTANTS
+const APP_VERSION = "2026-11-06 · 64x64 canvas";   // shown at the bottom of the home screen so you can tell which version is running
 const SIZE = 64;                 // canvas is SIZE x SIZE
 const SAMPLE_RATE = 22050;       // audio quality of the songs
 const MAX_SONG_SECONDS = 60;     // longest song the AI can write
@@ -753,6 +754,7 @@ const renderers = {
       const bt = el("button", i >= 2 ? "small wide" : "small", label); bt.onclick = () => go(id); menu.appendChild(bt);
     });
     v.appendChild(menu);
+    v.appendChild(el("p", "time", "App version: " + APP_VERSION));
   },
   messages(v) {
     v.appendChild(el("h2", null, "Talk to the AI"));
@@ -978,7 +980,7 @@ function refresh() {
 window.addEventListener("hashchange", () => { lastSig = ""; refresh(); });
 
 try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) { /* fine */ }
-if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").then(r => r.update()).catch(() => {});
 refresh();
 </script>
 </body>
