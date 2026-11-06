@@ -56,7 +56,8 @@ const SIZE = 32;                 // canvas is SIZE x SIZE
 const SAMPLE_RATE = 22050;       // audio quality of the songs
 const MAX_SONG_SECONDS = 60;     // longest song the AI can write
 const MAX_TRACKS = 4;            // channels per song
-const JOURNAL_SHOWN = 15;        // journal entries the AI sees each turn
+const JOURNAL_SHOWN = 40;        // journal entries the AI sees each turn
+const MAX_SELF = 1200;           // longest self-summary (characters) the AI can write
 const MESSAGES_SHOWN = 12;       // chat messages the AI sees each turn
 const MAX_NOTES_PER_TRACK = 800;
 const MAX_IN_ROW = 10;           // the same kind of action more than this many times in a row is refused
@@ -131,6 +132,12 @@ You have these actions. Each turn, reply with ONE JSON object and nothing else.
     Throw away the song you are currently working on. This does NOT delete finished songs in your
     collection. You cannot delete finished songs, and saving an identical song twice is refused.
     The same goes for journal entries: you cannot delete them, and identical ones are refused.
+
+{"action": "self", "text": "..."}
+    Write or rewrite your SELF-SUMMARY: a short note (at most ${MAX_SELF} characters) about who you are,
+    what you care about, what you've learned and what you want. It is shown to you at the top of
+    every single turn, so you never forget yourself even after old journal entries fade from view.
+    Rewrite it whenever you change or learn something about yourself. Old versions are kept for the human.
 
 {"action": "search", "query": "..."}
     Search the web with Google. You'll see a short summary of what it found next turn. Then you can write about it.
@@ -406,6 +413,7 @@ function updateDraft() {
   saveWorld();
   return note;
 }
+const mySelf = () => (W.selfLog && W.selfLog.length) ? W.selfLog[W.selfLog.length - 1] : null;
 const actionGroup = a => ({ paint: "drawing", rows: "drawing", draft: "music", add_notes: "music", compose: "music", finish_song: "music" }[a] || a);
 // A human message counts as waiting until the AI sends any "say". Deleting messages never re-triggers this.
 const humanWaiting = () => W.messages.some(m => m.from === "you" && m.answered === false);
@@ -521,6 +529,16 @@ async function runAction(reply) {
     W.messages.push({ time: nowStr(), from: "ai", text, new: false }); saveWorld();
     return "Message sent to the human.";
   }
+  if (action === "self") {
+    const text = String(reply.text || "").trim();
+    if (!text) return "Your self-summary was empty.";
+    if (text.length > MAX_SELF) return "Your self-summary is too long (" + text.length + " characters, the limit is " + MAX_SELF + "). It was NOT saved. Make it shorter.";
+    if (!W.selfLog) W.selfLog = [];
+    const cur = mySelf();
+    if (cur && normText(cur.text) === normText(text)) return "That is identical to your current self-summary, so nothing changed. Only rewrite it when something about you has changed.";
+    W.selfLog.push({ time: nowStr(), text }); saveWorld();
+    return "Self-summary updated. You will see it at the top of every turn.";
+  }
   if (action === "done") return "DONE";
   return "Unknown action: " + action;
 }
@@ -541,12 +559,17 @@ function buildPrompt(lastResult, minutesLeft, turnsLeft) {
   const titles = (arr, key) => arr.slice(-10).map(x => "'" + x[key] + "'").join(", ") || "(none yet)";
   const journal = W.journal.slice(-JOURNAL_SHOWN).map(e => "[" + e.time + "] " + e.text).join("\n") || "(empty, this is your first day)";
   const canvas = W.canvas.map((r, i) => pad2(i) + " " + r).join("\n");
+  const cur = mySelf();
+  const selfText = cur ? cur.text + "\n(last updated " + cur.time + ")" : "(You haven't written one yet. Consider using the \"self\" action to describe who you are becoming.)";
   let notices = "";
   if (humanWaiting()) notices += "\n!! THE HUMAN IS WAITING FOR AN ANSWER. Your next action MUST be \"say\" with your reply. Anything else will be refused.\n";
   const st = W.streak;
   if (st && st.count >= 7) notices += "\nHeads up: you have done '" + st.group + "' " + st.count + " times in a row. After " + MAX_IN_ROW + " in a row it is refused, so switch to something different.\n";
   return `It is ${nowStr()}.
 Time left today: about ${minutesLeft.toFixed(1)} minutes (${turnsLeft} actions).
+
+WHO YOU ARE (your own self-summary, written by you):
+${selfText}
 
 YOUR JOURNAL (most recent entries):
 ${journal}
@@ -709,8 +732,8 @@ const renderers = {
       bt.appendChild(el("small", null, n + (n === 1 ? " item" : " items")));
       bt.onclick = () => go(id); menu.appendChild(bt);
     });
-    [["canvas", "🖼️ Current canvas"], ["draft", "🎼 Song in progress"], ["settings", "⚙️ Settings"]].forEach(([id, label], i) => {
-      const bt = el("button", i === 2 ? "small wide" : "small", label); bt.onclick = () => go(id); menu.appendChild(bt);
+    [["canvas", "🖼️ Current canvas"], ["draft", "🎼 Song in progress"], ["self", "🪞 Who the AI says it is"], ["settings", "⚙️ Settings"]].forEach(([id, label], i) => {
+      const bt = el("button", i >= 2 ? "small wide" : "small", label); bt.onclick = () => go(id); menu.appendChild(bt);
     });
     v.appendChild(menu);
   },
@@ -799,6 +822,20 @@ const renderers = {
       d.appendChild(el("b", null, s.query)); d.appendChild(el("div", "time", s.time));
       d.appendChild(el("div", null, s.results)).style.whiteSpace = "pre-wrap";
       d.appendChild(delBtn("search", () => W.searches.splice(i, 1)));
+      v.appendChild(d);
+    });
+  },
+  self(v) {
+    v.appendChild(el("h2", null, "Who the AI says it is"));
+    v.appendChild(el("p", "dim", "The AI writes this itself and sees the newest version at the top of every turn. Older versions are kept here so you can watch it change."));
+    const log = W.selfLog || [];
+    if (!log.length) return empty(v, "It hasn't written one yet.");
+    log.map((e, i) => [e, i]).reverse().forEach(([e, i], n) => {
+      const d = el("div", "card");
+      d.appendChild(el("b", null, n === 0 ? "Current version" : "Earlier version"));
+      d.appendChild(el("div", "time", e.time));
+      d.appendChild(el("div", null, e.text)).style.whiteSpace = "pre-wrap";
+      d.appendChild(delBtn("self-summary version", () => W.selfLog.splice(i, 1)));
       v.appendChild(d);
     });
   },
@@ -898,6 +935,7 @@ function sig(name) {
     case "gallery": return String(W.gallery.length);
     case "music": return String(W.songs.length);
     case "journal": return String(W.journal.length);
+    case "self": return String((W.selfLog || []).length);
     case "searches": return W.searches.length + "|" + STATUS.searching;
     default: return "static";
   }
