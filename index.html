@@ -52,7 +52,7 @@ input[type=text],input[type=password],input[type=number]{width:100%;background:#
 "use strict";
 
 // ================================================================ CONSTANTS
-const SIZE = 32;                 // canvas is SIZE x SIZE
+const SIZE = 64;                 // canvas is SIZE x SIZE
 const SAMPLE_RATE = 22050;       // audio quality of the songs
 const MAX_SONG_SECONDS = 60;     // longest song the AI can write
 const MAX_TRACKS = 4;            // channels per song
@@ -189,10 +189,27 @@ function saveJSON(key, val) {
   try { localStorage.setItem(key, JSON.stringify(val)); return true; }
   catch (e) { toast("Could not save! Phone storage may be full."); return false; }
 }
+// Makes a saved canvas fit the current SIZE. An older, smaller canvas is enlarged evenly (32 -> 64 doubles every pixel).
+function fitCanvas(rows) {
+  if (!Array.isArray(rows) || !rows.length) return blankCanvas();
+  const n = rows.length;
+  if (n === SIZE && rows.every(r => String(r).length === SIZE)) return rows;
+  const k = SIZE % n === 0 ? SIZE / n : 1;
+  const out = [];
+  for (let y = 0; y < SIZE; y++) {
+    const src = rows[Math.floor(y / k)];
+    if (src === undefined) { out.push(".".repeat(SIZE)); continue; }
+    let line = "";
+    for (const ch of String(src)) line += ch.repeat(k);
+    out.push(line.padEnd(SIZE, ".").slice(0, SIZE));
+  }
+  return out;
+}
 let W = Object.assign(
   { journal: [], canvas: blankCanvas(), gallery: [], songs: [], searches: [], draft: null, messages: [] },
   loadJSON(KEYS.world, {})
 );
+W.canvas = fitCanvas(W.canvas);
 const saveWorld = () => saveJSON(KEYS.world, W);
 const getConfig = () => Object.assign({}, DEFAULTS, loadJSON(KEYS.config, {}));
 const updateConfig = changes => saveJSON(KEYS.config, Object.assign(loadJSON(KEYS.config, {}), changes));
@@ -364,7 +381,7 @@ async function askAI(prompt) {
   const payload = await callGemini({
     systemInstruction: { parts: [{ text: SYSTEM }] },
     contents: [{ role: "user", parts: [{ text: prompt }] }],
-    generationConfig: { responseMimeType: "application/json", temperature: 1.0, maxOutputTokens: 8192 }
+    generationConfig: { responseMimeType: "application/json", temperature: 1.0, maxOutputTokens: 16384 }
   });
   if (payload === null) return null;
   let text = replyText(payload).trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
@@ -763,7 +780,7 @@ const renderers = {
   },
   canvas(v) {
     v.appendChild(el("h2", null, "Canvas right now"));
-    const c = el("canvas"); draw(c, W.canvas, 14); v.appendChild(c);
+    const c = el("canvas"); draw(c, W.canvas, Math.floor(448 / W.canvas.length)); v.appendChild(c);
     v.appendChild(el("br"));
     const clr = delBtn("canvas drawing (clears the canvas, saved drawings stay)", () => { W.canvas = blankCanvas(); });
     clr.textContent = "🗑 Clear canvas"; v.appendChild(clr);
@@ -772,7 +789,7 @@ const renderers = {
     v.appendChild(el("h2", null, "Saved drawings"));
     if (!W.gallery.length) return empty(v, "Nothing saved yet.");
     W.gallery.map((p, i) => [p, i]).reverse().forEach(([p, i]) => {
-      const d = el("div", "g"); const c = el("canvas"); draw(c, p.rows, 8);
+      const d = el("div", "g"); const c = el("canvas"); draw(c, p.rows, Math.max(1, Math.floor(256 / p.rows.length)));
       d.appendChild(c); d.appendChild(el("div", null, p.title)); d.appendChild(el("div", "time", p.time));
       d.appendChild(el("div")).appendChild(delBtn("drawing", () => W.gallery.splice(i, 1)));
       v.appendChild(d);
@@ -918,6 +935,7 @@ const renderers = {
         if (data.app !== "ai-sandbox" || !data.world) throw new Error("That doesn't look like a backup from this app.");
         if (!confirm("Replace everything in this app with the backup?")) return;
         W = Object.assign({ journal: [], canvas: blankCanvas(), gallery: [], songs: [], searches: [], draft: null, messages: [] }, data.world);
+        W.canvas = fitCanvas(W.canvas);
         saveWorld(); toast("Backup restored."); refresh(true);
       } catch (e) { toast(e.message); }
     };
