@@ -59,6 +59,7 @@ const MAX_TRACKS = 4;            // channels per song
 const JOURNAL_SHOWN = 15;        // journal entries the AI sees each turn
 const MESSAGES_SHOWN = 12;       // chat messages the AI sees each turn
 const MAX_NOTES_PER_TRACK = 800;
+const MAX_IN_ROW = 10;           // the same kind of action more than this many times in a row is refused
 
 const PALETTE = {
   ".": "#ffffff", k: "#000000", d: "#555555", w: "#aaaaaa",
@@ -139,6 +140,13 @@ You have these actions. Each turn, reply with ONE JSON object and nothing else.
 
 {"action": "done"}
     End today's session early.
+
+RULES OF THIS WORLD:
+- If the human has sent you a message and you haven't answered yet, you MUST answer it with a
+  "say" action before doing anything else. Other actions are refused until you reply.
+- Variety rule: you may not do the same kind of thing more than ${MAX_IN_ROW} times in a row
+  (drawing = paint/rows, music = draft/add_notes/compose/finish_song; journal, search, etc. count
+  as their own kind). On the next try it is refused and you must do something different.
 
 Colors (letters): ${Object.entries(PALETTE).map(([k, v]) => k + "=" + v).join(", ")}
 "." means blank/white.
@@ -290,7 +298,7 @@ function wavBlob(pcm) {
 }
 
 // ================================================================ TALKING TO GOOGLE'S AI
-const STATUS = { running: false, last: "", error: "" };
+const STATUS = { running: false, last: "", error: "", searching: "" };
 let stopRequested = false, abortCtl = null, wakeLock = null;
 const API = "https://generativelanguage.googleapis.com/v1beta/";
 
@@ -398,7 +406,29 @@ function updateDraft() {
   saveWorld();
   return note;
 }
+const actionGroup = a => ({ paint: "drawing", rows: "drawing", draft: "music", add_notes: "music", compose: "music", finish_song: "music" }[a] || a);
+const humanWaiting = () => W.messages.length > 0 && W.messages[W.messages.length - 1].from === "you";
+
+// Wrapper that enforces the two world rules: always answer the human, and keep variety.
 async function doAction(reply) {
+  const action = String(reply.action);
+  const waiting = humanWaiting();
+  if (waiting && action !== "say") {
+    return "The human sent you a message and is waiting for an answer. You MUST reply with a \"say\" action before doing anything else. Your action was NOT performed.";
+  }
+  const group = actionGroup(action);
+  if (!W.streak) W.streak = { group: "", count: 0 };
+  if (action !== "done" && !waiting && W.streak.group === group && W.streak.count >= MAX_IN_ROW) {
+    return "VARIETY RULE: you have done '" + group + "' " + W.streak.count + " times in a row. Your action was NOT performed. Do something different now (for example: write in your journal, draw, compose, search, or message the human).";
+  }
+  const result = await runAction(reply);
+  if (action !== "done") {
+    if (W.streak.group === group) W.streak.count++; else W.streak = { group, count: 1 };
+    saveWorld();
+  }
+  return result;
+}
+async function runAction(reply) {
   const action = reply.action, canvas = W.canvas;
 
   if (action === "journal") {
@@ -477,7 +507,9 @@ async function doAction(reply) {
   if (action === "search") {
     const query = String(reply.query || "").trim();
     if (!query) return "Search query was empty.";
-    const results = await webSearch(query);
+    STATUS.searching = query; refresh();
+    let results;
+    try { results = await webSearch(query); } finally { STATUS.searching = ""; }
     W.searches.push({ time: nowStr(), query, results }); saveWorld();
     return "Search results for '" + query + "':\n" + results;
   }
@@ -507,6 +539,10 @@ function buildPrompt(lastResult, minutesLeft, turnsLeft) {
   const titles = (arr, key) => arr.slice(-10).map(x => "'" + x[key] + "'").join(", ") || "(none yet)";
   const journal = W.journal.slice(-JOURNAL_SHOWN).map(e => "[" + e.time + "] " + e.text).join("\n") || "(empty, this is your first day)";
   const canvas = W.canvas.map((r, i) => pad2(i) + " " + r).join("\n");
+  let notices = "";
+  if (humanWaiting()) notices += "\n!! THE HUMAN IS WAITING FOR AN ANSWER. Your next action MUST be \"say\" with your reply. Anything else will be refused.\n";
+  const st = W.streak;
+  if (st && st.count >= 7) notices += "\nHeads up: you have done '" + st.group + "' " + st.count + " times in a row. After " + MAX_IN_ROW + " in a row it is refused, so switch to something different.\n";
   return `It is ${nowStr()}.
 Time left today: about ${minutesLeft.toFixed(1)} minutes (${turnsLeft} actions).
 
@@ -525,7 +561,7 @@ ${canvas}
 
 YOUR SONG IN PROGRESS:
 ${draftText(W.draft)}
-
+${notices}
 RESULT OF YOUR LAST ACTION:
 ${lastResult || "(none yet, you just woke up)"}
 
@@ -749,6 +785,12 @@ const renderers = {
   },
   searches(v) {
     v.appendChild(el("h2", null, "Web searches"));
+    if (STATUS.searching) {
+      const live = el("div", "card");
+      live.appendChild(el("b", null, "🔍 The AI is searching Google right now..."));
+      live.appendChild(el("div", "dim", "Searching for: " + STATUS.searching));
+      v.appendChild(live);
+    }
     if (!W.searches.length) return empty(v, "No searches yet.");
     W.searches.map((s, i) => [s, i]).reverse().forEach(([s, i]) => {
       const d = el("div", "card");
@@ -854,7 +896,7 @@ function sig(name) {
     case "gallery": return String(W.gallery.length);
     case "music": return String(W.songs.length);
     case "journal": return String(W.journal.length);
-    case "searches": return String(W.searches.length);
+    case "searches": return W.searches.length + "|" + STATUS.searching;
     default: return "static";
   }
 }
