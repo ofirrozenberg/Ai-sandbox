@@ -407,7 +407,8 @@ function updateDraft() {
   return note;
 }
 const actionGroup = a => ({ paint: "drawing", rows: "drawing", draft: "music", add_notes: "music", compose: "music", finish_song: "music" }[a] || a);
-const humanWaiting = () => W.messages.length > 0 && W.messages[W.messages.length - 1].from === "you";
+// A human message counts as waiting until the AI sends any "say". Deleting messages never re-triggers this.
+const humanWaiting = () => W.messages.some(m => m.from === "you" && m.answered === false);
 
 // Wrapper that enforces the two world rules: always answer the human, and keep variety.
 async function doAction(reply) {
@@ -516,6 +517,7 @@ async function runAction(reply) {
   if (action === "say") {
     const text = String(reply.text || "").trim();
     if (!text) return "Your message was empty.";
+    W.messages.forEach(m => { if (m.from === "you") m.answered = true; });
     W.messages.push({ time: nowStr(), from: "ai", text, new: false }); saveWorld();
     return "Message sent to the human.";
   }
@@ -731,7 +733,7 @@ const renderers = {
     const send = el("button", null, "Send");
     send.onclick = () => {
       const text = ta.value.trim(); if (!text) return;
-      W.messages.push({ time: nowStr(), from: "you", text: text.slice(0, 4000), new: true }); saveWorld();
+      W.messages.push({ time: nowStr(), from: "you", text: text.slice(0, 4000), new: true, answered: false }); saveWorld();
       compose = ""; refresh(true);
     };
     bar.appendChild(ta); bar.appendChild(send); v.appendChild(bar);
