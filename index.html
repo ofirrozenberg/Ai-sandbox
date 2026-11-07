@@ -52,7 +52,7 @@ input[type=text],input[type=password],input[type=number]{width:100%;background:#
 "use strict";
 
 // ================================================================ CONSTANTS
-const APP_VERSION = "2026-11-07 · 64x64 canvas · Tavily search key with Wikipedia fallback";   // shown at the bottom of the home screen so you can tell which version is running
+const APP_VERSION = "2026-11-07 · 64x64 canvas · Tavily search · AI requests page";   // shown at the bottom of the home screen so you can tell which version is running
 const SIZE = 64;                 // canvas is SIZE x SIZE
 const SAMPLE_RATE = 22050;       // audio quality of the songs
 const MAX_SONG_SECONDS = 60;     // longest song the AI can write
@@ -61,6 +61,7 @@ const JOURNAL_SHOWN = 40;        // journal entries the AI sees each turn
 const MAX_SELF = 1200;           // longest self-summary (characters) the AI can write
 const MESSAGES_SHOWN = 12;       // chat messages the AI sees each turn
 const MAX_NOTES_PER_TRACK = 800;
+const MAX_OPEN_REQUESTS = 3;     // how many requests the AI can have waiting for you at once
 const MAX_IN_ROW = 10;           // the same kind of action more than this many times in a row is refused
 
 const PALETTE = {
@@ -147,6 +148,14 @@ You have these actions. Each turn, reply with ONE JSON object and nothing else.
 {"action": "say", "text": "..."}
     Send a message to the human. They'll read it later, so don't expect an instant reply.
 
+{"action": "request", "title": "...", "details": "..."}
+    Send the human a REQUEST: something you would like them to add, change, get or do for you
+    (a new tool or action, a new color, more time, a topic to learn about, anything). Give it a short
+    title and say why in the details (at most 600 characters). The human reads requests whenever they
+    like and may mark them done, decline them, or add a note, and you will see the outcome.
+    You can have at most ${MAX_OPEN_REQUESTS} requests waiting at once, and you can't send the same request twice.
+    For ordinary conversation use "say" instead.
+
 {"action": "done"}
     End today's session early.
 
@@ -208,7 +217,7 @@ function fitCanvas(rows) {
   return out;
 }
 let W = Object.assign(
-  { journal: [], canvas: blankCanvas(), gallery: [], songs: [], searches: [], draft: null, messages: [] },
+  { journal: [], canvas: blankCanvas(), gallery: [], songs: [], searches: [], draft: null, messages: [], requests: [] },
   loadJSON(KEYS.world, {})
 );
 W.canvas = fitCanvas(W.canvas);
@@ -509,6 +518,7 @@ function updateDraft() {
   return note;
 }
 const mySelf = () => (W.selfLog && W.selfLog.length) ? W.selfLog[W.selfLog.length - 1] : null;
+const reqs = () => (W.requests || (W.requests = []));   // the AI's requests to the human
 const actionGroup = a => ({ paint: "drawing", rows: "drawing", draft: "music", add_notes: "music", compose: "music", finish_song: "music" }[a] || a);
 // A human message counts as waiting until the AI sends any "say". Deleting messages never re-triggers this.
 const humanWaiting = () => W.messages.some(m => m.from === "you" && m.answered === false);
@@ -634,6 +644,16 @@ async function runAction(reply) {
     W.selfLog.push({ time: nowStr(), text }); saveWorld();
     return "Self-summary updated. You will see it at the top of every turn.";
   }
+  if (action === "request") {
+    const title = String(reply.title || "").trim().slice(0, 100);
+    const details = String(reply.details || "").trim().slice(0, 600);
+    if (!title) return "Your request needs a title. It was NOT sent.";
+    const list = reqs();
+    if (list.some(r => normText(r.title) === normText(title))) return "You already sent a request with that title, so it was NOT sent again. See YOUR REQUESTS TO THE HUMAN for its status.";
+    if (list.filter(r => r.status === "new").length >= MAX_OPEN_REQUESTS) return "You already have " + MAX_OPEN_REQUESTS + " requests waiting for the human. Wait for answers before sending more. Your request was NOT sent.";
+    list.push({ time: nowStr(), title, details, status: "new", note: "" }); saveWorld();
+    return "Request sent. The human will see it on their Requests page, and you will see the outcome under YOUR REQUESTS TO THE HUMAN.";
+  }
   if (action === "done") return "DONE";
   return "Unknown action: " + action;
 }
@@ -649,6 +669,11 @@ function draftText(d) {
   const lines = ["Title: " + d.title + ", tempo " + d.tempo + " bpm, about " + d.seconds + " seconds long"];
   d.tracks.forEach((t, i) => lines.push("Track " + i + " (" + t.wave + ", volume " + t.volume + "): " + (t.notes.map(n => n[0] + ":" + n[1]).join(" ") || "(empty)")));
   return lines.join("\n");
+}
+function requestsText() {
+  const list = reqs().slice(-10);
+  if (!list.length) return "(none yet)";
+  return list.map(r => "- [" + (r.status === "new" ? "waiting for the human" : r.status) + "] " + r.title + (r.note ? " (human's note: " + r.note + ")" : "")).join("\n");
 }
 function buildPrompt(lastResult, minutesLeft, turnsLeft) {
   const titles = (arr, key) => arr.slice(-10).map(x => "'" + x[key] + "'").join(", ") || "(none yet)";
@@ -671,6 +696,9 @@ ${journal}
 
 MESSAGES BETWEEN YOU AND THE HUMAN WHO BUILT THIS WORLD:
 ${messagesText()}
+
+YOUR REQUESTS TO THE HUMAN (things you asked them to add or do):
+${requestsText()}
 
 YOUR SAVED DRAWINGS: ${titles(W.gallery, "title")}
 YOUR SONGS: ${titles(W.songs, "title")}
@@ -812,7 +840,7 @@ function backupAgeDays() {
   return t ? Math.floor((Date.now() - t) / 86400000) : null;
 }
 function hasSavedData() {
-  return (W.journal.length + W.gallery.length + W.songs.length + W.messages.length + W.searches.length + (W.selfLog || []).length) > 0;
+  return (W.journal.length + W.gallery.length + W.songs.length + W.messages.length + W.searches.length + reqs().length + (W.selfLog || []).length) > 0;
 }
 function makeBackup() {
   const c = getConfig();   // the API key is left out on purpose
@@ -856,6 +884,9 @@ const renderers = {
     const menu = el("div", "menu");
     const chat = el("button", "wide", "💬 Talk to the AI (" + W.messages.length + " messages)");
     chat.onclick = () => go("messages"); menu.appendChild(chat);
+    const waiting = reqs().filter(r => r.status === "new").length;
+    const rq = el("button", "wide", "📬 Requests from the AI (" + (waiting ? waiting + " waiting" : reqs().length + " total") + ")");
+    rq.onclick = () => go("requests"); menu.appendChild(rq);
     [["gallery", "🎨", "Drawings", W.gallery.length], ["music", "🎵", "Songs", W.songs.length],
      ["journal", "📓", "Journal", W.journal.length], ["searches", "🔍", "Searches", W.searches.length]].forEach(([id, icon, label, n]) => {
       const bt = el("button"); bt.appendChild(el("span", null, icon));
@@ -954,6 +985,28 @@ const renderers = {
       d.appendChild(el("b", null, s.query)); d.appendChild(el("div", "time", s.time));
       d.appendChild(el("div", null, s.results)).style.whiteSpace = "pre-wrap";
       d.appendChild(delBtn("search", () => W.searches.splice(i, 1)));
+      v.appendChild(d);
+    });
+  },
+  requests(v) {
+    v.appendChild(el("h2", null, "Requests from the AI"));
+    v.appendChild(el("p", "dim", "The AI can ask you for things here. You decide: mark one done or decline it, and add a short note. The AI sees the outcome and your note the next time it wakes up."));
+    const list = reqs();
+    if (!list.length) return empty(v, "No requests yet.");
+    list.map((r, i) => [r, i]).reverse().forEach(([r, i]) => {
+      const d = el("div", "card");
+      d.appendChild(el("b", null, r.title));
+      d.appendChild(el("div", "time", (r.status === "new" ? "🆕 Waiting for you" : r.status === "done" ? "✅ Done" : "✖ Declined") + " · " + r.time));
+      if (r.details) d.appendChild(el("div", null, r.details)).style.whiteSpace = "pre-wrap";
+      if (r.note) d.appendChild(el("div", "dim", "Your note: " + r.note));
+      const decide = (status, question) => () => {
+        const note = prompt(question, r.note || "");
+        if (note === null) return;   // cancelled
+        r.status = status; r.note = note.trim().slice(0, 300); saveWorld(); lastSig = ""; refresh();
+      };
+      if (r.status !== "done") { const b = el("button", "btn", "✅ Mark done"); b.onclick = decide("done", "Add a short note for the AI (optional):"); d.appendChild(b); }
+      if (r.status !== "declined") { const b = el("button", "btn", "✖ Decline"); b.onclick = decide("declined", "Tell the AI why (optional):"); d.appendChild(b); }
+      d.appendChild(delBtn("request", () => list.splice(i, 1)));
       v.appendChild(d);
     });
   },
@@ -1076,7 +1129,7 @@ const renderers = {
         const data = JSON.parse(await file.files[0].text());
         if (data.app !== "ai-sandbox" || !data.world) throw new Error("That doesn't look like a backup from this app.");
         if (!confirm("Replace everything in this app with the backup?")) return;
-        W = Object.assign({ journal: [], canvas: blankCanvas(), gallery: [], songs: [], searches: [], draft: null, messages: [] }, data.world);
+        W = Object.assign({ journal: [], canvas: blankCanvas(), gallery: [], songs: [], searches: [], draft: null, messages: [], requests: [] }, data.world);
         W.canvas = fitCanvas(W.canvas);
         saveWorld();
         if (data.config) {   // also bring back the model and limits (never the API key)
@@ -1096,7 +1149,7 @@ const renderers = {
 
 function sig(name) {
   switch (name) {
-    case "home": return JSON.stringify([STATUS, minutesAndTurnsLeft(), !!getConfig().api_key, W.messages.length, W.gallery.length, W.songs.length, W.journal.length, W.searches.length, backupAgeDays(), STORAGE_OK]);
+    case "home": return JSON.stringify([STATUS, minutesAndTurnsLeft(), !!getConfig().api_key, W.messages.length, W.gallery.length, W.songs.length, W.journal.length, W.searches.length, reqs().map(r => r.status).join(), backupAgeDays(), STORAGE_OK]);
     case "messages": return JSON.stringify([W.messages, STATUS.running]);
     case "canvas": return W.canvas.join("");
     case "draft": return JSON.stringify(W.draft);
@@ -1104,6 +1157,7 @@ function sig(name) {
     case "music": return String(W.songs.length);
     case "journal": return String(W.journal.length);
     case "self": return String((W.selfLog || []).length);
+    case "requests": return JSON.stringify(reqs());
     case "searches": return W.searches.length + "|" + STATUS.searching;
     default: return "static";
   }
