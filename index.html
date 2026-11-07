@@ -52,7 +52,7 @@ input[type=text],input[type=password],input[type=number]{width:100%;background:#
 "use strict";
 
 // ================================================================ CONSTANTS
-const APP_VERSION = "2026-11-06 · 64x64 canvas";   // shown at the bottom of the home screen so you can tell which version is running
+const APP_VERSION = "2026-11-07 · 64x64 canvas · Tavily search key with Wikipedia fallback";   // shown at the bottom of the home screen so you can tell which version is running
 const SIZE = 64;                 // canvas is SIZE x SIZE
 const SAMPLE_RATE = 22050;       // audio quality of the songs
 const MAX_SONG_SECONDS = 60;     // longest song the AI can write
@@ -77,7 +77,8 @@ const DEFAULTS = {
   model: "gemini-2.5-flash",     // if you get a "model not found" error, change it in Settings
   daily_minutes: 10,             // how long the AI is awake per day
   max_turns: 25,                 // hard cap on AI actions per day
-  seconds_between_turns: 8       // pause between actions (free tiers have rate limits)
+  seconds_between_turns: 8,      // pause between actions (free tiers have rate limits)
+  search_key: ""                 // optional Tavily key for better web search (tavily.com)
 };
 
 const SYSTEM = `You are a curious AI living in a small sandbox world. Nobody is giving you
@@ -141,7 +142,7 @@ You have these actions. Each turn, reply with ONE JSON object and nothing else.
     Rewrite it whenever you change or learn something about yourself. Old versions are kept for the human.
 
 {"action": "search", "query": "..."}
-    Search the web with Google. You'll see a short summary of what it found next turn. Then you can write about it.
+    Search the web. You'll see a short list of results next turn. Then you can write about it.
 
 {"action": "say", "text": "..."}
     Send a message to the human. They'll read it later, so don't expect an instant reply.
@@ -350,7 +351,14 @@ async function callGemini(body, attempts = 5) {
       if (![429, 500, 502, 503, 504].includes(status)) {
         throw new Error("Google API error " + status + ": " + (await res.text()).slice(0, 300));
       }
-      problem = status === 429 ? "You hit Google's free limit." : "Google is busy right now (error " + status + ").";
+      let detail = "";
+      try { const j = JSON.parse(await res.text()); detail = ((j.error && j.error.message) || "").replace(/\s+/g, " ").slice(0, 220); } catch (e) { /* no details */ }
+      if (status === 429 && /per ?day|daily|limit:\s*0\b/i.test(detail)) {   // retrying won't help, so say so straight away
+        throw new Error("Google API error 429: this model's free quota for today is used up (or isn't available on the free plan). Google said: " + detail);
+      }
+      problem = status === 429
+        ? "Google says you're over a free limit" + (detail ? " (\"" + detail + "\")." : ".")
+        : "Google is busy right now (error " + status + ").";
     } catch (e) {
       if (stopRequested) return null;
       if (e.name === "AbortError") {
@@ -388,20 +396,89 @@ async function askAI(prompt) {
   let text = replyText(payload).trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
   try { return JSON.parse(text); } catch (e) { return undefined; }   // reply was cut off or not valid JSON
 }
+const TAVILY = { skipUntil: 0, badKey: "" };   // remembers a bad key / used-up credits so searches don't keep retrying
+const hostOf = u => { try { return new URL(u).hostname.replace(/^www\./, ""); } catch (e) { return ""; } };
+async function tavilySearch(query, key) {
+  const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 20000);
+  abortCtl = ctl;
+  try {
+    let res;
+    try {
+      res = await fetch("https://api.tavily.com/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": "Bearer " + key },
+        body: JSON.stringify({ query, search_depth: "basic", max_results: 5, include_answer: true }),   // "basic" costs 1 credit
+        signal: ctl.signal
+      });
+    } catch (e) {
+      if (e.name === "AbortError") throw new Error(stopRequested ? "interrupted" : "Tavily took too long to answer");
+      throw new Error("couldn't reach Tavily (it may not allow requests from this kind of app)");
+    }
+    if (res.status === 401 || res.status === 403) { TAVILY.badKey = key; throw new Error("Tavily rejected the search key"); }
+    if ([429, 432, 433].includes(res.status)) {
+      TAVILY.skipUntil = Date.now() + 30 * 60 * 1000;
+      throw new Error("your Tavily credits are used up or you're being rate limited (error " + res.status + ")");
+    }
+    if (!res.ok) throw new Error("Tavily error " + res.status);
+    const data = await res.json();
+    const items = Array.isArray(data.results) ? data.results.slice(0, 5) : [];
+    let out = data.answer ? "Summary: " + String(data.answer).slice(0, 600) + "\n" : "";
+    out += items.map(r => "- " + (r.title || "Untitled") + (r.url ? " (" + hostOf(r.url) + ")" : "") + ": " + String(r.content || "").replace(/\s+/g, " ").slice(0, 300)).join("\n");
+    if (!out.trim()) throw new Error("Tavily found nothing");
+    return out;
+  } finally { clearTimeout(timer); }
+}
 async function webSearch(query) {
+  const key = getConfig().search_key;
+  let problem = "";
+  if (key && key !== TAVILY.badKey && Date.now() >= TAVILY.skipUntil) {
+    try { return "(Results from Tavily.)\n" + await tavilySearch(query, key); }
+    catch (e) {
+      if (stopRequested) return "Search was interrupted.";
+      problem = "Tavily search isn't available right now: " + e.message + ".";
+    }
+  } else if (key) {
+    problem = key === TAVILY.badKey ? "Tavily rejected the search key earlier." : "Tavily credits ran out a little while ago.";
+  }
+  if (problem) {   // Tavily failed or ran out: use Wikipedia (Google Search is rarely on the free plan, so skip it)
+    try { return "(" + problem + " These results come from Wikipedia instead.)\n" + await wikiSearch(query); }
+    catch (e) { return "Search failed. " + problem + " Wikipedia also failed: " + e.message; }
+  }
+  return googleSearchWithFallback(query);   // no Tavily key: Google first, then Wikipedia
+}
+async function wikiSearch(query) {
+  const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 15000);
+  try {
+    const res = await fetch("https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=" + encodeURIComponent(query) + "&srlimit=4&format=json&origin=*", { signal: ctl.signal });
+    if (!res.ok) throw new Error("Wikipedia error " + res.status);
+    const items = ((await res.json()).query || {}).search || [];
+    if (!items.length) return "No Wikipedia results for that search.";
+    return items.map(x => "- " + x.title + ": " + new DOMParser().parseFromString(x.snippet, "text/html").body.textContent).join("\n");
+  } finally { clearTimeout(timer); }
+}
+async function googleSearchWithFallback(query) {
+  let googleProblem = "";
   try {
     const payload = await callGemini({
       contents: [{ role: "user", parts: [{ text: "Search the web for: " + query + "\n\nReply with a short, factual summary (at most 8 lines) of what you find. Mention the names of your sources." }] }],
       tools: [{ google_search: {} }],
       generationConfig: { maxOutputTokens: 1024 }
-    });
+    }, 2);
     if (payload === null) return "Search was interrupted.";
     let text = replyText(payload).trim();
     const chunks = (((payload.candidates || [])[0] || {}).groundingMetadata || {}).groundingChunks || [];
     const names = [...new Set(chunks.map(c => c.web && c.web.title).filter(Boolean))].slice(0, 5);
     if (names.length) text += "\n(Sources: " + names.join(", ") + ")";
-    return text || "No results found.";
-  } catch (e) { return "Search failed: " + e.message; }
+    if (text) return text;
+    googleProblem = "Google returned an empty answer.";
+  } catch (e) { googleProblem = e.message; }
+  if (stopRequested) return "Search was interrupted.";
+  try {   // Google Search often isn't included in the free plan, so fall back to Wikipedia
+    const wiki = await wikiSearch(query);
+    return "(Google Search isn't available right now: " + googleProblem.slice(0, 250) + "\nThese results come from Wikipedia instead.)\n" + wiki;
+  } catch (e) {
+    return "Search failed. Google said: " + googleProblem.slice(0, 250) + " Wikipedia also failed: " + e.message;
+  }
 }
 
 // ================================================================ THE AI'S ACTIONS
@@ -719,6 +796,32 @@ function downloadSong(s) {
     setTimeout(() => URL.revokeObjectURL(url), 10000);
   } catch (e) { toast(e.message); }
 }
+let STORAGE_OK = null;   // true = Chrome promised to keep this app's data, false = it hasn't
+async function checkStorage() {
+  try {
+    if (navigator.storage && navigator.storage.persisted) {
+      STORAGE_OK = await navigator.storage.persisted();
+      if (!STORAGE_OK && navigator.storage.persist) STORAGE_OK = await navigator.storage.persist();
+    }
+  } catch (e) { /* not available, fine */ }
+  lastSig = ""; refresh();
+}
+const LAST_BACKUP_KEY = "sandbox_last_backup";
+function backupAgeDays() {
+  const t = Number(loadJSON(LAST_BACKUP_KEY, 0));
+  return t ? Math.floor((Date.now() - t) / 86400000) : null;
+}
+function hasSavedData() {
+  return (W.journal.length + W.gallery.length + W.songs.length + W.messages.length + W.searches.length + (W.selfLog || []).length) > 0;
+}
+function makeBackup() {
+  const c = getConfig();   // the API key is left out on purpose
+  downloadText("ai-sandbox-backup-" + todayStr() + ".json",
+    JSON.stringify({ app: "ai-sandbox", version: 2, world: W, config: { model: c.model, daily_minutes: c.daily_minutes, max_turns: c.max_turns } }));
+  saveJSON(LAST_BACKUP_KEY, Date.now());
+  toast("Backup saved to your Downloads folder.");
+  refresh();
+}
 function downloadText(filename, text) {
   const url = URL.createObjectURL(new Blob([text], { type: "application/json" }));
   const a = document.createElement("a"); a.href = url; a.download = filename;
@@ -739,6 +842,16 @@ const renderers = {
     const b = el("button", "go", STATUS.running ? "Put it to sleep" : "Wake the AI up");
     b.onclick = async () => { toast(STATUS.running ? stopSession() : await startSession()); };
     card.appendChild(b); v.appendChild(card);
+
+    const days = backupAgeDays();
+    if (hasSavedData() && (days === null || days >= 3)) {
+      const warn = el("div", "card");
+      warn.appendChild(el("b", null, "💾 " + (days === null ? "No backup yet" : "Last backup was " + days + " days ago")));
+      warn.appendChild(el("div", "dim", "If Chrome or a phone cleaner wipes this app's data, a backup lets you get everything back."));
+      const bb = el("button", "go grey", "⬇ Back up now"); bb.onclick = makeBackup; warn.appendChild(bb);
+      v.appendChild(warn);
+    }
+    if (STORAGE_OK === false) v.appendChild(el("div", "err", "⚠️ Chrome hasn't promised to keep this app's saved data. Back up regularly."));
 
     const menu = el("div", "menu");
     const chat = el("button", "wide", "💬 Talk to the AI (" + W.messages.length + " messages)");
@@ -879,6 +992,8 @@ const renderers = {
     }
     field("api_key", "API key", "", "password", c.api_key ? "(saved, leave blank to keep it)" : "Paste your key here");
     field("model", "Model", c.model);
+    field("search_key", "Search key (Tavily, optional)", "", "password", c.search_key ? "(saved, leave blank to keep it)" : "Paste a Tavily key (starts with tvly-)");
+    v.appendChild(el("p", "time", "Optional. Get a free key at tavily.com (1,000 free searches a month, no card). Without it the AI tries Google, then Wikipedia. If Tavily refuses or runs out, the AI uses Wikipedia."));
     field("daily_minutes", "Minutes awake per day", c.daily_minutes, "number");
     field("max_turns", "Max actions per day", c.max_turns, "number");
     const out = el("div", "dim"); out.style.marginTop = "10px";
@@ -888,10 +1003,12 @@ const renderers = {
       const ch = {}, key = fields.api_key.value.trim(), model = fields.model.value.trim();
       if (key) ch.api_key = key;
       if (model) ch.model = model;
+      const sk = fields.search_key.value.trim();
+      if (sk) { ch.search_key = sk; TAVILY.badKey = ""; TAVILY.skipUntil = 0; }
       const dm = parseFloat(fields.daily_minutes.value), mt = parseInt(fields.max_turns.value, 10);
       if (isFinite(dm)) ch.daily_minutes = clamp(dm, 1, 180);
       if (isFinite(mt)) ch.max_turns = clamp(mt, 1, 500);
-      updateConfig(ch); fields.api_key.value = ""; toast("Settings saved.");
+      updateConfig(ch); fields.api_key.value = ""; fields.search_key.value = ""; toast("Settings saved.");
     };
     v.appendChild(save);
 
@@ -906,6 +1023,26 @@ const renderers = {
       } catch (e) { out.className = "err"; out.textContent = e.message; }
     };
     v.appendChild(test);
+
+    const tsearch = el("button", "go grey", "Test search key");
+    tsearch.onclick = async () => {
+      const typed = fields.search_key.value.trim();
+      if (typed) { updateConfig({ search_key: typed }); fields.search_key.value = ""; }
+      const key = typed || getConfig().search_key;
+      if (!key) { out.className = "err"; out.textContent = "Paste your Tavily search key first."; return; }
+      TAVILY.badKey = ""; TAVILY.skipUntil = 0;
+      out.className = "dim"; out.textContent = "Testing the search key...";
+      try {
+        const r = await tavilySearch("cat", key);
+        out.className = "ok"; out.textContent = "The search key works. First result: " + (r.split("\n").find(l => l.startsWith("- ")) || r).slice(0, 120);
+      } catch (e) { out.className = "err"; out.textContent = "Tavily problem: " + e.message + ". The AI will use Wikipedia instead."; }
+    };
+    v.appendChild(tsearch);
+    if (c.search_key) {
+      const rm = el("button", "btn", "Remove search key");
+      rm.onclick = () => { updateConfig({ search_key: "" }); toast("Search key removed."); lastSig = ""; refresh(); };
+      v.appendChild(rm);
+    }
 
     const list = el("button", "go grey", "Show available models");
     list.onclick = async () => {
@@ -928,8 +1065,11 @@ const renderers = {
     v.appendChild(el("h2", null, "Backup"));
     v.appendChild(el("p", "dim", "Everything lives in this app on your phone. If you clear Chrome's data it's gone, so save a backup now and then. Your API key is not included."));
     const bk = el("button", "btn", "⬇ Download backup");
-    bk.onclick = () => downloadText("ai-sandbox-backup-" + todayStr() + ".json", JSON.stringify({ app: "ai-sandbox", version: 1, world: W }));
+    bk.onclick = makeBackup;
     v.appendChild(bk);
+    const days = backupAgeDays();
+    v.appendChild(el("p", "time", "Last backup: " + (days === null ? "never" : days === 0 ? "today" : days + " days ago")));
+    v.appendChild(el("p", STORAGE_OK === false ? "err" : "time", "Storage protection: " + (STORAGE_OK === true ? "on (Chrome promised to keep this app's data)" : STORAGE_OK === false ? "off (Chrome may delete this app's data, for example when the phone is low on space)" : "unknown")));
     const file = el("input"); file.type = "file"; file.accept = ".json,application/json"; file.style.display = "none";
     file.onchange = async () => {
       try {
@@ -938,7 +1078,15 @@ const renderers = {
         if (!confirm("Replace everything in this app with the backup?")) return;
         W = Object.assign({ journal: [], canvas: blankCanvas(), gallery: [], songs: [], searches: [], draft: null, messages: [] }, data.world);
         W.canvas = fitCanvas(W.canvas);
-        saveWorld(); toast("Backup restored."); refresh(true);
+        saveWorld();
+        if (data.config) {   // also bring back the model and limits (never the API key)
+          const ch = {};
+          if (typeof data.config.model === "string" && data.config.model) ch.model = data.config.model;
+          if (isFinite(data.config.daily_minutes)) ch.daily_minutes = clamp(Number(data.config.daily_minutes), 1, 180);
+          if (isFinite(data.config.max_turns)) ch.max_turns = clamp(Math.floor(Number(data.config.max_turns)), 1, 500);
+          updateConfig(ch);
+        }
+        toast("Backup restored. You still need to enter your API key (and search key)."); refresh(true);
       } catch (e) { toast(e.message); }
     };
     const rs = el("button", "btn", "⬆ Restore from backup"); rs.onclick = () => file.click();
@@ -948,7 +1096,7 @@ const renderers = {
 
 function sig(name) {
   switch (name) {
-    case "home": return JSON.stringify([STATUS, minutesAndTurnsLeft(), !!getConfig().api_key, W.messages.length, W.gallery.length, W.songs.length, W.journal.length, W.searches.length]);
+    case "home": return JSON.stringify([STATUS, minutesAndTurnsLeft(), !!getConfig().api_key, W.messages.length, W.gallery.length, W.songs.length, W.journal.length, W.searches.length, backupAgeDays(), STORAGE_OK]);
     case "messages": return JSON.stringify([W.messages, STATUS.running]);
     case "canvas": return W.canvas.join("");
     case "draft": return JSON.stringify(W.draft);
@@ -979,7 +1127,7 @@ function refresh() {
 }
 window.addEventListener("hashchange", () => { lastSig = ""; refresh(); });
 
-try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) { /* fine */ }
+checkStorage();
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").then(r => r.update()).catch(() => {});
 refresh();
 </script>
